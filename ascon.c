@@ -7,6 +7,9 @@
 // reference: ascon.isec.tugraz.at
 ///////////////////////////////////////
 
+#ifdef __APPLE__
+#include <sys/random.h>
+#endif
 #include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -14,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Algorithm Flow:
@@ -97,19 +101,9 @@ static uint8_t *read_file(const char *path, size_t *len);
 static uint64_t load64(const uint8_t *p);
 static uint64_t load_bytes(const uint8_t *p, size_t n);
 static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out);
+static uint8_t chartonib(char c);
 static void load_inputs(const opts_t *opts, a_config_t *a_config,
                         a_ctx_t *a_context);
-
-/* input:
- *
- * enc/dec mode
- * plaintext / ciphertext
- * key
- * nonce
- * associated data
- * tag (decrypt only)
- *
- * */
 
 int main(int argc, char *argv[]) {
 
@@ -130,6 +124,7 @@ int main(int argc, char *argv[]) {
   return EXIT_SUCCESS;
 }
 
+// shows how to use
 static void print_usage(FILE *out, const char *prog) {
   fprintf(
       out,
@@ -154,6 +149,7 @@ static void print_usage(FILE *out, const char *prog) {
       prog, prog, prog);
 }
 
+// gets params from args
 static void parse_args(int argc, char *argv[], opts_t *opts) {
   int opt;
 
@@ -276,12 +272,14 @@ static void parse_args(int argc, char *argv[], opts_t *opts) {
   }
 }
 
+// for key buffer, sets to 0 before freeing
 static void secure_zero(void *p, size_t n) {
   volatile uint8_t *v = p;
   while (n--)
     *v++ = 0; // zero everything up to n
 }
 
+// reads a file and outputs the stream
 static uint8_t *read_file(const char *path, size_t *len) {
   FILE *f = fopen(path, "rb");
 
@@ -320,6 +318,7 @@ static uint8_t *read_file(const char *path, size_t *len) {
   return data;
 }
 
+// load 64 bits in little-endian order
 static uint64_t load64(const uint8_t *p) {
   uint64_t w = 0;
   for (int i = 0; i < 8; i++) {
@@ -329,6 +328,7 @@ static uint64_t load64(const uint8_t *p) {
   return w;
 }
 
+// load bytes in little endian order to an n
 static uint64_t load_bytes(const uint8_t *p, size_t n) {
   uint64_t w = 0;
   for (size_t i = 0; i < n; i++) { // append little endian to n bytes
@@ -337,6 +337,7 @@ static uint64_t load_bytes(const uint8_t *p, size_t n) {
   return w;
 }
 
+// takes byte stream and turns into little endian lanes
 static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
   size_t blocks = len / 16 + 1; // room for padding in the last block
 
@@ -360,6 +361,18 @@ static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
   }
 }
 
+static uint8_t chartonib(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0'; // '7' - '0' = 7
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10; // 'c' - 'a' + 10 = 12
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10; // 'C' gives 12 too
+  else
+    return 0; // to silence compiler
+}
+
+// read files and enforce endianness
 static void load_inputs(const opts_t *opts, a_config_t *a_config,
                         a_ctx_t *a_context) {
   a_config->mode = opts->mode;
@@ -372,12 +385,11 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     secure_zero(key_bytes, key_len); // zero this
     free(key_bytes);
     exit(EXIT_FAILURE);
-  }
-  // key should be good, so now we copy in little endian
+  } // key should be good, so now we copy in little endian
   a_config->key[0] = load64(key_bytes);
   a_config->key[1] = load64(key_bytes + 8);
   secure_zero(key_bytes, key_len); // zero this
-  free(key_bytes);
+  free(key_bytes);                 // free mem
 
   // associated data (optional)
   if (opts->ad_path) {
@@ -392,11 +404,26 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
   // read in plaintext/ciphertext
   switch (opts->mode) {
   case MODE_ENCRYPT:
+
     // input nonce
     if (opts->nonce_hex == NULL) {
-      // generate random nonce
+      uint8_t nonce_bytes[16];
+      if (getentropy(nonce_bytes, 16) != 0) { // get 16 random bytes from OS
+        perror("getentropy");
+        exit(EXIT_FAILURE);
+      }
+      a_config->nonce[0] = load64(nonce_bytes);
+      a_config->nonce[1] = load64(nonce_bytes + 8);
     } else {
-      // a_config->nonce = nonce as 128 bit
+      // split nonce into two words
+      // flip the endianness
+      uint8_t nonce_bytes[16];
+      for (int i = 0; i < 16; i++) {
+        nonce_bytes[i] = (chartonib(*(opts->nonce_hex + 2 + (2 * i))) << 4) |
+                         chartonib(*(opts->nonce_hex + 2 + (2 * i) + 1));
+      }
+      a_config->nonce[0] = load64(nonce_bytes);
+      a_config->nonce[1] = load64(nonce_bytes + 8);
     }
 
     // input plaintext
