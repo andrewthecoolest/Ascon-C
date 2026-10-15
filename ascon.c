@@ -91,9 +91,16 @@ struct a_config { // fixed inputs
   uint64_t key[2];       // 128 bits
   uint64_t nonce[2];     // 128 bits
   buf_t associated_data; // len 0 = no AD
-  uint64_t input_tag[2]; // 128 bits, used for validating decryption
 };
 
+// Crypto Functions
+static void a_permute(uint64_t state[5], uint8_t rounds);
+static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]);
+static void a_procad(buf_t associated_data, uint64_t state[5]);
+static void a_enc(a_ctx_t *context);
+static int8_t a_dec(a_ctx_t *context); // decrypt return status if tag invalid
+
+// I/O Functions
 static void print_usage(FILE *out, const char *prog);
 static void parse_args(int argc, char *argv[], opts_t *opts);
 static void secure_zero(void *p, size_t n);
@@ -114,15 +121,66 @@ int main(int argc, char *argv[]) {
   parse_args(argc, argv, &opts);
   load_inputs(&opts, &a_config, &a_context);
 
-  // encrypt / decrypt
+  // instaciate state
+  a_init(a_config.key, a_config.nonce, a_context.state);
+
+  // process associated date if exists
+  if (a_config.associated_data
+          .data) { // AD path, does .data instanciate as NULL?
+    a_procad(a_config.associated_data, a_context.state);
+  }
+
+  // encrypt or decrypt
+  switch (a_config.mode) {
+  case MODE_ENCRYPT:
+    // encryption
+    break;
+
+  case MODE_DECRYPT:
+    // decryption
+    break;
+
+  case MODE_NONE:
+    break;
+  }
   // write output
 
+  secure_zero(a_context.plaintext.data, a_context.plaintext.len);
+  secure_zero(a_context.ciphertext.data, a_context.ciphertext.len);
+  secure_zero(a_config.associated_data.data, a_config.associated_data.len);
   free(a_context.plaintext.data);
   free(a_context.ciphertext.data);
   free(a_config.associated_data.data);
 
   return EXIT_SUCCESS;
 }
+
+static void a_permute(uint64_t state[5], uint8_t rounds) {
+  // run the permutation
+}
+
+static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]) {
+  // init
+}
+
+static void a_procad(buf_t associated_data, uint64_t state[5]) {
+  // process associated_data
+}
+
+static void a_enc(a_ctx_t *context) {
+  // do encryption
+}
+
+static int8_t a_dec(a_ctx_t *context) { // decrypt return status if tag invalid
+  // do decryption
+  return EXIT_SUCCESS;
+}
+
+//////////////////////////////////////////////////
+//
+// ALL I/O NO CRYPTO
+//
+//////////////////////////////////////////////////
 
 // shows how to use
 static void print_usage(FILE *out, const char *prog) {
@@ -454,8 +512,8 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     // load in
     a_config->nonce[0] = load64(nonce_bytes);
     a_config->nonce[1] = load64(nonce_bytes + 8);
-    a_config->input_tag[0] = load64(tag_bytes);
-    a_config->input_tag[1] = load64(tag_bytes + 8);
+    a_context->tag[0] = load64(tag_bytes);
+    a_context->tag[1] = load64(tag_bytes + 8);
 
     // cipher left by subtraction
     to_lanes(in_bytes + 16, in_len - 16, true, &a_context->ciphertext);
