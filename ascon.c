@@ -398,6 +398,7 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     if (ad_len > 0) { // empty AD skips the AD phase, len stays 0
       to_lanes(ad_bytes, ad_len, true, &a_config->associated_data);
     }
+    secure_zero(ad_bytes, ad_len);
     free(ad_bytes);
   }
 
@@ -430,15 +431,37 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     size_t pt_len;
     uint8_t *pt_bytes = read_file(opts->in_path, &pt_len);
     to_lanes(pt_bytes, pt_len, true, &a_context->plaintext);
+    secure_zero(pt_bytes, pt_len);
     free(pt_bytes);
     break;
 
   case MODE_DECRYPT: {
     // parse decryption file
+    // in form: { NONCE || CIPHERTEXT || TAG } / {16 bytes, ? bytes, , 16
+    // bytes}
     size_t in_len;
     uint8_t *in_bytes = read_file(opts->in_path, &in_len);
 
-    free(in_bytes); // youngboy never leakmemory again
+    uint8_t nonce_bytes[16];
+    uint8_t tag_bytes[16];
+    // nonce parse -- take first 16 bytes
+    // tag parse -- take last 16 bytes
+    for (int i = 0; i < 16; i++) {
+      nonce_bytes[i] = *(in_bytes + i);
+      tag_bytes[i] = *(in_bytes - 16 + i);
+      // need to make sure in_len calculation is correct
+    }
+    // load in
+    a_config->nonce[0] = load64(nonce_bytes);
+    a_config->nonce[1] = load64(nonce_bytes + 8);
+    a_config->input_tag[0] = load64(tag_bytes);
+    a_config->input_tag[1] = load64(tag_bytes + 8);
+
+    // cipher left by subtraction
+    to_lanes(in_bytes + 16, in_len - 16, true, &a_context->ciphertext);
+
+    secure_zero(in_bytes, in_len); // zero it
+    free(in_bytes);                // youngboy never leakmemory again
     break;
   }
 
