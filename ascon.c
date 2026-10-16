@@ -262,6 +262,23 @@ static void a_procad(buf_t associated_data, uint64_t state[5]) {
 
 static void a_enc(a_ctx_t *context) {
   // do encryption
+  size_t last = context->plaintext.len / 16; // index of the last block
+
+  // first n-1 full blocks: absorb, squeeze, permute
+  for (size_t i = 0; i < last; i++) {
+    context->state[0] ^= *(context->plaintext.data + 2 * i);
+    context->state[1] ^= *(context->plaintext.data + (2 * i) + 1);
+    *(context->ciphertext.data + 2 * i) = context->state[0];
+    *(context->ciphertext.data + (2 * i) + 1) = context->state[1];
+
+    a_permute(context->state, 8);
+  }
+
+  // last block
+  context->state[0] ^= *(context->plaintext.data + 2 * last);
+  context->state[1] ^= *(context->plaintext.data + (2 * last) + 1);
+  *(context->ciphertext.data + 2 * last) = context->state[0];
+  *(context->ciphertext.data + (2 * last) + 1) = context->state[1];
 }
 
 static int8_t a_dec(a_ctx_t *context) { // decrypt return status if tag invalid
@@ -592,6 +609,17 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     to_lanes(pt_bytes, pt_len, true, &a_context->plaintext);
     secure_zero(pt_bytes, pt_len);
     free(pt_bytes);
+
+    // make room for ciphertext
+    a_context->ciphertext.data =
+        calloc(2 * ((a_context->plaintext.len / 16) + 1),
+               sizeof *a_context->plaintext.data);
+    if (a_context->ciphertext.data == NULL) {
+      perror("calloc"); // maybe out of memory
+      exit(EXIT_FAILURE);
+    }
+    a_context->ciphertext.len = sizeof(*a_context->ciphertext.data);
+
     break;
 
   case MODE_DECRYPT: {
