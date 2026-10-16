@@ -136,11 +136,8 @@ int main(int argc, char *argv[]) {
   // instaciate state
   a_init(a_config.key, a_config.nonce, a_context.state);
 
-  // process associated date if exists
-  if (a_config.associated_data
-          .data) { // AD path, does .data instanciate as NULL?
-    a_procad(a_config.associated_data, a_context.state);
-  }
+  // process associated data (can be empty)
+  a_procad(a_config.associated_data, a_context.state);
 
   // encrypt or decrypt
   switch (a_config.mode) {
@@ -178,7 +175,7 @@ int main(int argc, char *argv[]) {
 
 */
 
-static void a_subs(uint64_t state[5]) {
+static void a_subs(uint64_t state[5]) { // substitution round
   uint64_t x0 = state[0]; // copy inputs first, outputs overwrite state
   uint64_t x1 = state[1];
   uint64_t x2 = state[2];
@@ -203,7 +200,7 @@ static void a_subs(uint64_t state[5]) {
 
 */
 
-static void a_diff(uint64_t state[5]) {
+static void a_diff(uint64_t state[5]) { // diffusion round
   // diffusion
   state[0] ^= ((state[0] >> 19) | (state[0] << (64 - 19))) ^
               ((state[0] >> 28) | (state[0] << (64 - 28)));
@@ -252,6 +249,15 @@ static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]) {
 
 static void a_procad(buf_t associated_data, uint64_t state[5]) {
   // process associated_data
+  if (associated_data.data != NULL) { // check if associate data is empty
+    for (int i = 0; i < (associated_data.len / 16) + 1; i++) {
+      state[0] ^= *(associated_data.data + 2 * i);
+      state[1] ^= *(associated_data.data + (2 * i) + 1);
+
+      a_permute(state, 8);
+    }
+  }
+  state[4] ^= 0x8000000000000000ULL; // flip the MSB
 }
 
 static void a_enc(a_ctx_t *context) {
