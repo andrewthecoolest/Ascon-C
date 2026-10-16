@@ -65,6 +65,14 @@ typedef enum {
 
 static const uint64_t ASCON_IV = 0x00001000808c0001ULL; // Ascon-AEAD128 IV
 
+static const uint64_t ASCON_CTABLE[16] = {
+    0x000000000000003cULL, 0x000000000000002dULL, 0x000000000000001eULL,
+    0x000000000000000fULL, 0x00000000000000f0ULL, 0x00000000000000e1ULL,
+    0x00000000000000d2ULL, 0x00000000000000c3ULL, 0x00000000000000b4ULL,
+    0x00000000000000a5ULL, 0x0000000000000096ULL, 0x0000000000000087ULL,
+    0x0000000000000078ULL, 0x0000000000000069ULL, 0x000000000000005aULL,
+    0x000000000000004bULL};
+
 struct buffer { // little endian lanes, 2 per 128-bit block
   uint64_t *data;
   size_t len; // length in bytes, before padding
@@ -94,6 +102,8 @@ struct a_config { // fixed inputs
 };
 
 // Crypto Functions
+static void a_subs(uint64_t state[5]);
+static void a_diff(uint64_t state[5]);
 static void a_permute(uint64_t state[5], uint8_t rounds);
 static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]);
 static void a_procad(buf_t associated_data, uint64_t state[5]);
@@ -111,6 +121,8 @@ static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out);
 static uint8_t chartonib(char c);
 static void load_inputs(const opts_t *opts, a_config_t *a_config,
                         a_ctx_t *a_context);
+
+// TODO: make sure exits secure zero everything before leaving early
 
 int main(int argc, char *argv[]) {
 
@@ -145,6 +157,7 @@ int main(int argc, char *argv[]) {
   }
   // write output
 
+  secure_zero(a_config.key, 16);
   secure_zero(a_context.plaintext.data, a_context.plaintext.len);
   secure_zero(a_context.ciphertext.data, a_context.ciphertext.len);
   secure_zero(a_config.associated_data.data, a_config.associated_data.len);
@@ -155,12 +168,86 @@ int main(int argc, char *argv[]) {
   return EXIT_SUCCESS;
 }
 
+/*
+
+𝑦0 = 𝑥4𝑥1 ⊕ 𝑥3 ⊕ 𝑥2𝑥1 ⊕ 𝑥2 ⊕ 𝑥1𝑥0 ⊕ 𝑥1 ⊕ 𝑥0,
+𝑦1 = 𝑥4 ⊕ 𝑥3𝑥2 ⊕ 𝑥3𝑥1 ⊕ 𝑥3 ⊕ 𝑥2𝑥1 ⊕ 𝑥2 ⊕ 𝑥1 ⊕ 𝑥0,
+𝑦2 = 𝑥4𝑥3 ⊕ 𝑥4 ⊕ 𝑥2 ⊕ 𝑥1 ⊕ 1,
+𝑦3 = 𝑥4𝑥0 ⊕ 𝑥4 ⊕ 𝑥3𝑥0 ⊕ 𝑥3 ⊕ 𝑥2 ⊕ 𝑥1 ⊕ 𝑥0,
+𝑦4 = 𝑥4𝑥1 ⊕ 𝑥4 ⊕ 𝑥3 ⊕ 𝑥1𝑥0 ⊕ 𝑥1
+
+*/
+
+static void a_subs(uint64_t state[5]) {
+  uint64_t x0 = state[0]; // copy inputs first, outputs overwrite state
+  uint64_t x1 = state[1];
+  uint64_t x2 = state[2];
+  uint64_t x3 = state[3];
+  uint64_t x4 = state[4];
+
+  state[0] = (x4 & x1) ^ (x3) ^ (x2 & x1) ^ (x2) ^ (x1 & x0) ^ (x1) ^ (x0);
+  state[1] =
+      (x4) ^ (x3 & x2) ^ (x3 & x1) ^ (x3) ^ (x2 & x1) ^ (x2) ^ (x1) ^ (x0);
+  state[2] = ~((x4 & x3) ^ (x4) ^ (x2) ^ (x1)); // ^ 1 on every bit = NOT
+  state[3] = (x4 & x0) ^ (x4) ^ (x3 & x0) ^ (x3) ^ (x2) ^ (x1) ^ (x0);
+  state[4] = (x4 & x1) ^ (x4) ^ (x3) ^ (x1 & x0) ^ (x1);
+}
+
+/*
+
+Σ0(𝑆0) = 𝑆0 ⊕ (𝑆0 ⋙ 19) ⊕ (𝑆0 ⋙ 28) (8)
+Σ1(𝑆1) = 𝑆1 ⊕ (𝑆1 ⋙ 61) ⊕ (𝑆1 ⋙ 39) (9)
+Σ2(𝑆2) = 𝑆2 ⊕ (𝑆2 ⋙ 1) ⊕ (𝑆2 ⋙ 6) (10)
+Σ3(𝑆3) = 𝑆3 ⊕ (𝑆3 ⋙ 10) ⊕ (𝑆3 ⋙ 17) (11)
+Σ4(𝑆4) = 𝑆4 ⊕ (𝑆4 ⋙ 7) ⊕ (𝑆4 ⋙ 41) (12)
+
+*/
+
+static void a_diff(uint64_t state[5]) {
+  // diffusion
+  state[0] ^= ((state[0] >> 19) | (state[0] << (64 - 19))) ^
+              ((state[0] >> 28) | (state[0] << (64 - 28)));
+
+  state[1] ^= ((state[1] >> 61) | (state[1] << (64 - 61))) ^
+              ((state[1] >> 39) | (state[1] << (64 - 39)));
+
+  state[2] ^= ((state[2] >> 1) | (state[2] << (64 - 1))) ^
+              ((state[2] >> 6) | (state[2] << (64 - 6)));
+
+  state[3] ^= ((state[3] >> 10) | (state[3] << (64 - 10))) ^
+              ((state[3] >> 17) | (state[3] << (64 - 17)));
+
+  state[4] ^= ((state[4] >> 7) | (state[4] << (64 - 7))) ^
+              ((state[4] >> 41) | (state[4] << (64 - 41)));
+}
+
 static void a_permute(uint64_t state[5], uint8_t rounds) {
+  uint8_t minround = 16 - rounds;
   // run the permutation
+  for (int i = 0; i < rounds; i++) {
+    // add round constant
+    state[2] ^= ASCON_CTABLE[minround + i];
+    // substitution
+    a_subs(state);
+    // diffusion
+    a_diff(state);
+  }
 }
 
 static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]) {
   // init
+  state[0] |= ASCON_IV;
+  state[1] |= key[0];
+  state[2] |= key[1];
+  state[3] |= nonce[0];
+  state[4] |= nonce[1];
+
+  // 12 rounds permutation
+  a_permute(state, 12);
+
+  // XOR key to state
+  state[3] ^= key[0];
+  state[4] ^= key[1];
 }
 
 static void a_procad(buf_t associated_data, uint64_t state[5]) {
@@ -345,18 +432,25 @@ static uint8_t *read_file(const char *path, size_t *len) {
     perror(path);
     exit(EXIT_FAILURE);
   }
-
-  fseek(f, 0, SEEK_END);     // go to EOF
+  if (fseek(f, 0, SEEK_END) == -1) { // go to EOF
+    perror("fseek");
+    exit(EXIT_FAILURE);
+  }
   long file_size = ftell(f); // get file size
-  rewind(f);                 // go back to beginning
+  if (file_size == -1) {
+    perror("ftell");
+    exit(EXIT_FAILURE);
+  }
+  size_t f_size = (size_t)file_size;
+  rewind(f); // go back to beginning
 
-  if (file_size == 0) { // empty may be valid
+  if (f_size == 0) { // empty may be valid
     *len = 0;
     fclose(f);
     return NULL;
   }
 
-  uint8_t *data = malloc(file_size); // point data to heap allotment
+  uint8_t *data = malloc(f_size); // point data to heap allotment
 
   if (data == NULL) {
     perror("malloc"); // maybe out of memory
@@ -364,14 +458,14 @@ static uint8_t *read_file(const char *path, size_t *len) {
     exit(EXIT_FAILURE);
   }
 
-  if (fread(data, 1, file_size, f) != (size_t)file_size) {
+  if (fread(data, 1, f_size, f) != f_size) {
     fprintf(stderr, "Error: Unexpected end of file %s\n", path);
     fclose(f);
     free(data); // leaking memory in this economy? nah.
     exit(EXIT_FAILURE);
   }
 
-  *len = (size_t)file_size;
+  *len = f_size;
   fclose(f);
   return data;
 }
@@ -421,11 +515,11 @@ static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
 
 static uint8_t chartonib(char c) {
   if (c >= '0' && c <= '9')
-    return c - '0'; // '7' - '0' = 7
+    return (uint8_t)(c - '0'); // '7' - '0' = 7
   if (c >= 'a' && c <= 'f')
-    return c - 'a' + 10; // 'c' - 'a' + 10 = 12
+    return (uint8_t)(c - 'a' + 10); // 'c' - 'a' + 10 = 12
   if (c >= 'A' && c <= 'F')
-    return c - 'A' + 10; // 'C' gives 12 too
+    return (uint8_t)(c - 'A' + 10); // 'C' gives 12 too
   else
     return 0; // to silence compiler
 }
@@ -478,8 +572,9 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
       // flip the endianness
       uint8_t nonce_bytes[16];
       for (int i = 0; i < 16; i++) {
-        nonce_bytes[i] = (chartonib(*(opts->nonce_hex + 2 + (2 * i))) << 4) |
-                         chartonib(*(opts->nonce_hex + 2 + (2 * i) + 1));
+        nonce_bytes[i] =
+            (uint8_t)((chartonib(*(opts->nonce_hex + 2 + (2 * i))) << 4) |
+                      chartonib(*(opts->nonce_hex + 2 + (2 * i) + 1)));
       }
       a_config->nonce[0] = load64(nonce_bytes);
       a_config->nonce[1] = load64(nonce_bytes + 8);
@@ -500,23 +595,21 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     size_t in_len;
     uint8_t *in_bytes = read_file(opts->in_path, &in_len);
 
-    uint8_t nonce_bytes[16];
-    uint8_t tag_bytes[16];
+    if (in_len < 32) {
+      fprintf(stderr, "Error: Decryption file too small %zu\n", in_len);
+      exit(EXIT_FAILURE);
+    }
+
     // nonce parse -- take first 16 bytes
     // tag parse -- take last 16 bytes
-    for (int i = 0; i < 16; i++) {
-      nonce_bytes[i] = *(in_bytes + i);
-      tag_bytes[i] = *(in_bytes - 16 + i);
-      // need to make sure in_len calculation is correct
-    }
     // load in
-    a_config->nonce[0] = load64(nonce_bytes);
-    a_config->nonce[1] = load64(nonce_bytes + 8);
-    a_context->tag[0] = load64(tag_bytes);
-    a_context->tag[1] = load64(tag_bytes + 8);
+    a_config->nonce[0] = load64(in_bytes);
+    a_config->nonce[1] = load64(in_bytes + 8);
+    a_context->tag[0] = load64(in_bytes + in_len - 16);
+    a_context->tag[1] = load64(in_bytes + in_len - 8);
 
     // cipher left by subtraction
-    to_lanes(in_bytes + 16, in_len - 16, true, &a_context->ciphertext);
+    to_lanes(in_bytes + 16, in_len - 32, false, &a_context->ciphertext);
 
     secure_zero(in_bytes, in_len); // zero it
     free(in_bytes);                // youngboy never leakmemory again
