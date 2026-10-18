@@ -2,3 +2,5 @@
 ascon
 *.dSYM
 .clang-format
+*.enc
+*.dec
