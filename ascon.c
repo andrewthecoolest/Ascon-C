@@ -108,7 +108,7 @@ static void a_permute(uint64_t state[5], uint8_t rounds);
 static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]);
 static void a_procad(buf_t associated_data, uint64_t state[5]);
 static void a_enc(a_ctx_t *context);
-static int8_t a_dec(a_ctx_t *context); // decrypt return status if tag invalid
+static void a_dec(a_ctx_t *context);
 
 // I/O Functions
 static void print_usage(FILE *out, const char *prog);
@@ -142,7 +142,7 @@ int main(int argc, char *argv[]) {
   // encrypt or decrypt
   switch (a_config.mode) {
   case MODE_ENCRYPT:
-    // encryption
+    a_enc(&a_context);
     break;
 
   case MODE_DECRYPT:
@@ -262,7 +262,8 @@ static void a_procad(buf_t associated_data, uint64_t state[5]) {
 
 static void a_enc(a_ctx_t *context) {
   // do encryption
-  size_t last = context->plaintext.len / 16; // index of the last block
+  size_t last = context->plaintext.len / 16;     // index of the last block
+  size_t last_len = context->plaintext.len % 16; // rem in bytes
 
   // first n-1 full blocks: absorb, squeeze, permute
   for (size_t i = 0; i < last; i++) {
@@ -275,15 +276,71 @@ static void a_enc(a_ctx_t *context) {
   }
 
   // last block
+  uint64_t mask0, mask1;
+  if (last_len < 8) { // partial lane 0, lane 1 untouched
+    mask0 = (1ULL << (8 * last_len)) - 1;
+    mask1 = 0;
+  } else {         // full lane 0, partial lane 1
+    mask0 = ~0ULL; // not (1ULL << 64) - 1, shift by 64 is UB
+    mask1 = (1ULL << (8 * (last_len - 8))) - 1;
+  }
+
+  // state keeps the full XOR, padding is already in the plaintext lanes
   context->state[0] ^= *(context->plaintext.data + 2 * last);
   context->state[1] ^= *(context->plaintext.data + (2 * last) + 1);
-  *(context->ciphertext.data + 2 * last) = context->state[0];
-  *(context->ciphertext.data + (2 * last) + 1) = context->state[1];
+
+  // Cn = S[0:l-1], drop the keystream past the data
+  *(context->ciphertext.data + 2 * last) = context->state[0] & mask0;
+  *(context->ciphertext.data + (2 * last) + 1) = context->state[1] & mask1;
 }
 
-static int8_t a_dec(a_ctx_t *context) { // decrypt return status if tag invalid
+static void a_dec(a_ctx_t *context) { // decrypt return status if tag invalid
   // do decryption
-  return EXIT_SUCCESS;
+  size_t last = context->ciphertext.len / 16; // index of the last 128 bit block
+  size_t last_len = context->ciphertext.len % 16; // rem in bytes
+
+  // first n-1 full blocks: xor out, set, permute
+  for (size_t i = 0; i < last; i++) { // i is 128bit jumps
+    *(context->plaintext.data + 2 * i) =
+        context->state[0] ^ *(context->ciphertext.data + 2 * i);
+    *(context->plaintext.data + (2 * i) + 1) =
+        context->state[1] ^ *(context->ciphertext.data + (2 * i) + 1);
+
+    context->state[0] = *(context->ciphertext.data + 2 * i);
+    context->state[1] = *(context->ciphertext.data + (2 * i) + 1);
+
+    a_permute(context->state, 8);
+  }
+
+  // last block: only last_len bytes are real, split the 128-bit mask per lane
+  uint64_t mask0, mask1, pad0, pad1;
+  if (last_len < 8) { // partial lane 0, lane 1 untouched
+    mask0 = (1ULL << (8 * last_len)) - 1;
+    mask1 = 0;
+    pad0 = 1ULL << (8 * last_len); // 1 || 0* right after the data
+    pad1 = 0;
+  } else {         // full lane 0, partial lane 1
+    mask0 = ~0ULL; // not (1ULL << 64) - 1, shift by 64 is UB
+    mask1 = (1ULL << (8 * (last_len - 8))) - 1;
+    pad0 = 0;
+    pad1 = 1ULL << (8 * (last_len - 8));
+  }
+
+  uint64_t c0 = *(context->ciphertext.data + 2 * last);
+  uint64_t c1 = *(context->ciphertext.data + (2 * last) + 1);
+
+  // Pn = S[0:l-1] ^ Cn
+  *(context->plaintext.data + 2 * last) = (context->state[0] ^ c0) & mask0;
+  *(context->plaintext.data + (2 * last) + 1) =
+      (context->state[1] ^ c1) & mask1;
+
+  // S[l:127] ^= 1 || 0*
+  context->state[0] ^= pad0;
+  context->state[1] ^= pad1;
+
+  // S[0:l-1] = Cn, keep the rest
+  context->state[0] = (context->state[0] & ~mask0) | (c0 & mask0);
+  context->state[1] = (context->state[1] & ~mask1) | (c1 & mask1);
 }
 
 //////////////////////////////////////////////////
@@ -513,10 +570,13 @@ static uint64_t load_bytes(const uint8_t *p, size_t n) {
 }
 
 // takes byte stream and turns into little endian lanes
+// a lane is just 64 bits of a 128 bit block
 static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
   size_t blocks = len / 16 + 1; // room for padding in the last block
 
-  out->data = calloc(blocks * 2, sizeof *out->data); // zeroed
+  out->data =
+      calloc(blocks * 2, sizeof *out->data); // zeroed
+                                             // 2*block bc count in uint64_t
   if (out->data == NULL) {
     perror("calloc");
     exit(EXIT_FAILURE);
@@ -618,7 +678,7 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
       perror("calloc"); // maybe out of memory
       exit(EXIT_FAILURE);
     }
-    a_context->ciphertext.len = sizeof(*a_context->ciphertext.data);
+    a_context->ciphertext.len = a_context->plaintext.len;
 
     break;
 
@@ -647,6 +707,17 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
 
     secure_zero(in_bytes, in_len); // zero it
     free(in_bytes);                // youngboy never leakmemory again
+
+    // make room for plaintext
+    a_context->plaintext.data =
+        calloc(2 * ((a_context->ciphertext.len / 16) + 1),
+               sizeof *a_context->ciphertext.data);
+    if (a_context->plaintext.data == NULL) {
+      perror("calloc"); // maybe out of memory
+      exit(EXIT_FAILURE);
+    }
+    a_context->plaintext.len = a_context->ciphertext.len;
+
     break;
   }
 
