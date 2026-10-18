@@ -109,26 +109,35 @@ static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]);
 static void a_procad(buf_t associated_data, uint64_t state[5]);
 static void a_enc(a_ctx_t *context);
 static void a_dec(a_ctx_t *context);
+static void a_final(a_ctx_t *context, a_config_t *config);
+static void a_out(a_ctx_t *context, a_config_t *config, const char *path);
 
 // I/O Functions
 static void print_usage(FILE *out, const char *prog);
 static void parse_args(int argc, char *argv[], opts_t *opts);
 static void secure_zero(void *p, size_t n);
+static void wipe_buf(buf_t *b);
+_Noreturn static void secure_exit(int status);
 static uint8_t *read_file(const char *path, size_t *len);
 static uint64_t load64(const uint8_t *p);
 static uint64_t load_bytes(const uint8_t *p, size_t n);
-static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out);
+static bool to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out);
+static void write_lanes(FILE *f, const uint64_t *lanes, size_t len);
 static uint8_t chartonib(char c);
 static void load_inputs(const opts_t *opts, a_config_t *a_config,
                         a_ctx_t *a_context);
 
-// TODO: make sure exits secure zero everything before leaving early
+// registered in main so secure_exit can wipe secrets from any function
+static a_config_t *g_config = NULL;
+static a_ctx_t *g_context = NULL;
 
 int main(int argc, char *argv[]) {
 
   opts_t opts = {0};
   a_config_t a_config = {0};
   a_ctx_t a_context = {0};
+  g_config = &a_config;
+  g_context = &a_context;
 
   parse_args(argc, argv, &opts);
   load_inputs(&opts, &a_config, &a_context);
@@ -143,26 +152,36 @@ int main(int argc, char *argv[]) {
   switch (a_config.mode) {
   case MODE_ENCRYPT:
     a_enc(&a_context);
+
+    // finalize
+    a_final(&a_context, &a_config);
+
+    // write output
+    a_out(&a_context, &a_config, opts.out_path);
     break;
 
   case MODE_DECRYPT:
-    // decryption
+    a_dec(&a_context);
+
+    // finalize
+    uint64_t tmptag[2] = {a_context.tag[0], a_context.tag[1]};
+    a_final(&a_context, &a_config);
+    uint64_t diff = (a_context.tag[0] ^ tmptag[0]) |
+                    (a_context.tag[1] ^ tmptag[1]); // for const time compare
+    if (diff != 0) {
+      fprintf(stderr, "Error: Decryption tag does not match\n");
+      secure_exit(EXIT_FAILURE); // release no plaintext
+    }
+
+    // write output
+    a_out(&a_context, &a_config, opts.out_path);
     break;
 
   case MODE_NONE:
     break;
   }
-  // write output
 
-  secure_zero(a_config.key, 16);
-  secure_zero(a_context.plaintext.data, a_context.plaintext.len);
-  secure_zero(a_context.ciphertext.data, a_context.ciphertext.len);
-  secure_zero(a_config.associated_data.data, a_config.associated_data.len);
-  free(a_context.plaintext.data);
-  free(a_context.ciphertext.data);
-  free(a_config.associated_data.data);
-
-  return EXIT_SUCCESS;
+  secure_exit(EXIT_SUCCESS); // wipe on the normal path too
 }
 
 /*
@@ -250,7 +269,7 @@ static void a_init(uint64_t key[2], uint64_t nonce[2], uint64_t state[5]) {
 static void a_procad(buf_t associated_data, uint64_t state[5]) {
   // process associated_data
   if (associated_data.data != NULL) { // check if associate data is empty
-    for (int i = 0; i < (associated_data.len / 16) + 1; i++) {
+    for (unsigned long i = 0; i < (associated_data.len / 16) + 1; i++) {
       state[0] ^= *(associated_data.data + 2 * i);
       state[1] ^= *(associated_data.data + (2 * i) + 1);
 
@@ -341,6 +360,51 @@ static void a_dec(a_ctx_t *context) { // decrypt return status if tag invalid
   // S[0:l-1] = Cn, keep the rest
   context->state[0] = (context->state[0] & ~mask0) | (c0 & mask0);
   context->state[1] = (context->state[1] & ~mask1) | (c1 & mask1);
+}
+
+static void a_final(a_ctx_t *context, a_config_t *config) {
+  uint64_t statex[5] = {0, 0, config->key[0], config->key[1], 0};
+  for (int i = 0; i < 5; i++) {
+    context->state[i] ^= statex[i];
+  }
+  a_permute(context->state, 12);
+  context->tag[0] = context->state[3] ^ config->key[0];
+  context->tag[1] = context->state[4] ^ config->key[1];
+}
+
+static void a_out(a_ctx_t *context, a_config_t *config, const char *path) {
+  if (path == NULL) { // no -o given, pick a default name
+    path = (config->mode == MODE_ENCRYPT) ? "ascon.enc" : "ascon.dec";
+  }
+
+  FILE *f = fopen(path, "wb");
+
+  if (f == NULL) { // check if file open went ok
+    perror(path);
+    secure_exit(EXIT_FAILURE);
+  }
+
+  switch (config->mode) {
+  case MODE_ENCRYPT:
+    // Nonce || Ciphertext (truncated) || Tag
+    write_lanes(f, config->nonce, 16);
+    write_lanes(f, context->ciphertext.data, context->ciphertext.len);
+    write_lanes(f, context->tag, 16);
+    break;
+
+  case MODE_DECRYPT:
+    // plaintext only, tag was already checked
+    write_lanes(f, context->plaintext.data, context->plaintext.len);
+    break;
+
+  case MODE_NONE:
+    break;
+  }
+
+  if (fclose(f) != 0) { // flush can fail
+    perror(path);
+    secure_exit(EXIT_FAILURE);
+  }
 }
 
 //////////////////////////////////////////////////
@@ -504,22 +568,47 @@ static void secure_zero(void *p, size_t n) {
     *v++ = 0; // zero everything up to n
 }
 
+// zero the whole lane allocation (2 lanes per block + pad block), then free
+static void wipe_buf(buf_t *b) {
+  if (b->data != NULL) {
+    secure_zero(b->data, 2 * (b->len / 16 + 1) * sizeof *b->data);
+    free(b->data);
+    b->data = NULL;
+  }
+  b->len = 0;
+}
+
+// wipe every secret main registered, then exit
+_Noreturn static void secure_exit(int status) {
+  if (g_config != NULL) {
+    secure_zero(g_config->key, sizeof g_config->key);
+    wipe_buf(&g_config->associated_data);
+  }
+  if (g_context != NULL) {
+    secure_zero(g_context->state, sizeof g_context->state); // invertible to key
+    secure_zero(g_context->tag, sizeof g_context->tag);
+    wipe_buf(&g_context->plaintext);
+    wipe_buf(&g_context->ciphertext);
+  }
+  exit(status);
+}
+
 // reads a file and outputs the stream
 static uint8_t *read_file(const char *path, size_t *len) {
   FILE *f = fopen(path, "rb");
 
   if (f == NULL) { // check if file open went ok
     perror(path);
-    exit(EXIT_FAILURE);
+    secure_exit(EXIT_FAILURE);
   }
   if (fseek(f, 0, SEEK_END) == -1) { // go to EOF
     perror("fseek");
-    exit(EXIT_FAILURE);
+    secure_exit(EXIT_FAILURE);
   }
   long file_size = ftell(f); // get file size
   if (file_size == -1) {
     perror("ftell");
-    exit(EXIT_FAILURE);
+    secure_exit(EXIT_FAILURE);
   }
   size_t f_size = (size_t)file_size;
   rewind(f); // go back to beginning
@@ -535,14 +624,15 @@ static uint8_t *read_file(const char *path, size_t *len) {
   if (data == NULL) {
     perror("malloc"); // maybe out of memory
     fclose(f);
-    exit(EXIT_FAILURE);
+    secure_exit(EXIT_FAILURE);
   }
 
   if (fread(data, 1, f_size, f) != f_size) {
     fprintf(stderr, "Error: Unexpected end of file %s\n", path);
     fclose(f);
-    free(data); // leaking memory in this economy? nah.
-    exit(EXIT_FAILURE);
+    secure_zero(data, f_size); // partial read is still secret
+    free(data);                // leaking memory in this economy? nah.
+    secure_exit(EXIT_FAILURE);
   }
 
   *len = f_size;
@@ -571,7 +661,8 @@ static uint64_t load_bytes(const uint8_t *p, size_t n) {
 
 // takes byte stream and turns into little endian lanes
 // a lane is just 64 bits of a 128 bit block
-static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
+// returns false on allocation failure so the caller can wipe bytes first
+static bool to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
   size_t blocks = len / 16 + 1; // room for padding in the last block
 
   out->data =
@@ -579,7 +670,7 @@ static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
                                              // 2*block bc count in uint64_t
   if (out->data == NULL) {
     perror("calloc");
-    exit(EXIT_FAILURE);
+    return false;
   }
   out->len = len;
 
@@ -593,6 +684,18 @@ static void to_lanes(const uint8_t *bytes, size_t len, bool pad, buf_t *out) {
   }
   if (pad) {
     out->data[full] ^= (uint64_t)0x01 << (8 * rem); // 0x01 right after the data
+  }
+  return true;
+}
+
+// write len bytes out of little endian lanes, undoes to_lanes
+static void write_lanes(FILE *f, const uint64_t *lanes, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    uint8_t b = (uint8_t)(lanes[i / 8] >> (8 * (i % 8))); // byte i of stream
+    if (fputc(b, f) == EOF) {
+      perror("fputc");
+      secure_exit(EXIT_FAILURE);
+    }
   }
 }
 
@@ -619,7 +722,7 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     fprintf(stderr, "Error: Key invalid length %zu\n", key_len);
     secure_zero(key_bytes, key_len); // zero this
     free(key_bytes);
-    exit(EXIT_FAILURE);
+    secure_exit(EXIT_FAILURE);
   } // key should be good, so now we copy in little endian
   a_config->key[0] = load64(key_bytes);
   a_config->key[1] = load64(key_bytes + 8);
@@ -630,11 +733,14 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
   if (opts->ad_path) {
     size_t ad_len;
     uint8_t *ad_bytes = read_file(opts->ad_path, &ad_len);
+    bool ad_ok = true;
     if (ad_len > 0) { // empty AD skips the AD phase, len stays 0
-      to_lanes(ad_bytes, ad_len, true, &a_config->associated_data);
+      ad_ok = to_lanes(ad_bytes, ad_len, true, &a_config->associated_data);
     }
     secure_zero(ad_bytes, ad_len);
     free(ad_bytes);
+    if (!ad_ok)
+      secure_exit(EXIT_FAILURE);
   }
 
   // read in plaintext/ciphertext
@@ -646,7 +752,7 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
       uint8_t nonce_bytes[16];
       if (getentropy(nonce_bytes, 16) != 0) { // get 16 random bytes from OS
         perror("getentropy");
-        exit(EXIT_FAILURE);
+        secure_exit(EXIT_FAILURE);
       }
       a_config->nonce[0] = load64(nonce_bytes);
       a_config->nonce[1] = load64(nonce_bytes + 8);
@@ -666,9 +772,11 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     // input plaintext
     size_t pt_len;
     uint8_t *pt_bytes = read_file(opts->in_path, &pt_len);
-    to_lanes(pt_bytes, pt_len, true, &a_context->plaintext);
+    bool pt_ok = to_lanes(pt_bytes, pt_len, true, &a_context->plaintext);
     secure_zero(pt_bytes, pt_len);
     free(pt_bytes);
+    if (!pt_ok)
+      secure_exit(EXIT_FAILURE);
 
     // make room for ciphertext
     a_context->ciphertext.data =
@@ -676,7 +784,7 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
                sizeof *a_context->plaintext.data);
     if (a_context->ciphertext.data == NULL) {
       perror("calloc"); // maybe out of memory
-      exit(EXIT_FAILURE);
+      secure_exit(EXIT_FAILURE);
     }
     a_context->ciphertext.len = a_context->plaintext.len;
 
@@ -691,7 +799,9 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
 
     if (in_len < 32) {
       fprintf(stderr, "Error: Decryption file too small %zu\n", in_len);
-      exit(EXIT_FAILURE);
+      secure_zero(in_bytes, in_len);
+      free(in_bytes);
+      secure_exit(EXIT_FAILURE);
     }
 
     // nonce parse -- take first 16 bytes
@@ -703,10 +813,13 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
     a_context->tag[1] = load64(in_bytes + in_len - 8);
 
     // cipher left by subtraction
-    to_lanes(in_bytes + 16, in_len - 32, false, &a_context->ciphertext);
+    bool ct_ok =
+        to_lanes(in_bytes + 16, in_len - 32, false, &a_context->ciphertext);
 
     secure_zero(in_bytes, in_len); // zero it
     free(in_bytes);                // youngboy never leakmemory again
+    if (!ct_ok)
+      secure_exit(EXIT_FAILURE);
 
     // make room for plaintext
     a_context->plaintext.data =
@@ -714,7 +827,7 @@ static void load_inputs(const opts_t *opts, a_config_t *a_config,
                sizeof *a_context->ciphertext.data);
     if (a_context->plaintext.data == NULL) {
       perror("calloc"); // maybe out of memory
-      exit(EXIT_FAILURE);
+      secure_exit(EXIT_FAILURE);
     }
     a_context->plaintext.len = a_context->ciphertext.len;
 
